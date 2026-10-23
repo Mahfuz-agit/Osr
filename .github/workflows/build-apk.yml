@@ -57,6 +57,27 @@ jobs:
       - name: Get packages
         run: flutter pub get
 
+      - name: Install Android SDK platform 37
+        run: |
+          SDKM="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+            "$SDKM" "platforms;android-37" || true
+          else
+            echo "sdkmanager not found, Gradle will try to download the SDK itself."
+          fi
+
+      - name: Show versions and Gradle config
+        run: |
+          flutter --version
+          java -version
+          for f in android/build.gradle* android/settings.gradle* android/app/build.gradle* android/gradle/wrapper/gradle-wrapper.properties; do
+            if [ -f "$f" ]; then echo "==== $f"; cat "$f"; fi
+          done
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
       - name: Build release APK
         run: flutter build apk --release
 
