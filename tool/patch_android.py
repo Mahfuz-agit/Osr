@@ -1,7 +1,11 @@
+import glob
 import pathlib
 import re
 import sys
 
+REQUIRED_COMPILE_SDK = 37  # permission_handler 13.x needs compileSdk 37
+
+# ---------------------------------------------------------------- manifest
 path = pathlib.Path("android/app/src/main/AndroidManifest.xml")
 if not path.exists():
     sys.exit("AndroidManifest.xml not found. Run flutter create first.")
@@ -33,3 +37,31 @@ for attr in (
 
 path.write_text(s, encoding="utf-8")
 print("Patched", path)
+
+# ------------------------------------------------------------------ gradle
+# Works for both Kotlin DSL (build.gradle.kts) and Groovy (build.gradle).
+pattern = re.compile(r"compileSdk(?:Version)?\s*=?\s*(flutter\.compileSdkVersion|\d+)")
+
+
+def bump(match):
+    value = match.group(1)
+    if value.isdigit() and int(value) >= REQUIRED_COMPILE_SDK:
+        return match.group(0)
+    return "compileSdk = %d" % REQUIRED_COMPILE_SDK
+
+
+patched = False
+for g in glob.glob("android/app/build.gradle*"):
+    gp = pathlib.Path(g)
+    text = gp.read_text(encoding="utf-8")
+    new = pattern.sub(bump, text)
+    if new != text:
+        gp.write_text(new, encoding="utf-8")
+        print("compileSdk set to %d in %s" % (REQUIRED_COMPILE_SDK, g))
+        patched = True
+    elif pattern.search(text):
+        print("compileSdk already >= %d in %s" % (REQUIRED_COMPILE_SDK, g))
+        patched = True
+
+if not patched:
+    print("WARNING: compileSdk line not found. Check the Gradle printout in the log.")

@@ -1,3 +1,4 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -66,6 +67,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await _loadAccess();
   }
 
+  Future<void> _pickFolder() async {
+    try {
+      final path = await FilePicker.getDirectoryPath(dialogTitle: 'Choose your video folder');
+      if (path == null) return;
+      _folder.text = path;
+      app.setFolderPath(path);
+      await app.setFolderEnabled(true);
+      if (!await Sources.hasAccess()) {
+        await _askAccess();
+      } else {
+        app.markDirty();
+      }
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open the folder picker')),
+      );
+    }
+  }
+
   void _addUrl() {
     final u = _url.text.trim();
     if (!u.startsWith('http')) {
@@ -98,6 +119,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
             subtitle: Text('${app.localCount} videos'),
             value: app.folderEnabled,
             onChanged: app.setFolderEnabled,
+          ),
+          ListTile(
+            leading: const Icon(Icons.folder_open_rounded),
+            title: const Text('Choose folder'),
+            subtitle: const Text('Pick the folder that holds your videos'),
+            onTap: _pickFolder,
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
