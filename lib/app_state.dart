@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart' show ThemeMode;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'models.dart';
@@ -16,7 +17,7 @@ class AppState extends ChangeNotifier {
 
   late SharedPreferences _p;
 
-  // Settings
+  // ---- Settings ----
   bool folderEnabled = true;
   String folderPath = defaultFolder;
   List<String> manifests = <String>[];
@@ -25,10 +26,18 @@ class AppState extends ChangeNotifier {
   bool autoNext = false;
   bool haptics = true;
   bool cacheOffline = true;
+  bool showShare = false;
+  bool reduceTransparency = false;
+  bool ambient = true;
+  String themeKey = 'system';
+  final ValueNotifier<ThemeMode> themeMode = ValueNotifier<ThemeMode>(ThemeMode.system);
+
   Set<String> favorites = <String>{};
   Set<String> knownIds = <String>{};
+  String? lastId;
+  int lastPosMs = 0;
 
-  // Feed
+  // ---- Feed ----
   List<VideoItem> items = <VideoItem>[];
   int feedVersion = 0;
   int localCount = 0;
@@ -36,6 +45,10 @@ class AppState extends ChangeNotifier {
   bool loading = true;
   bool refreshing = false;
   String? toast;
+
+  /// Set at runtime if the ambient blur makes scrolling janky.
+  bool ambientThrottled = false;
+  bool get ambientOn => ambient && !ambientThrottled;
 
   List<VideoItem> _remote = <VideoItem>[];
   Set<String> _allIds = <String>{};
@@ -55,8 +68,15 @@ class AppState extends ChangeNotifier {
     autoNext = _p.getBool('autoNext') ?? false;
     haptics = _p.getBool('haptics') ?? true;
     cacheOffline = _p.getBool('cacheOffline') ?? true;
+    showShare = _p.getBool('showShare') ?? false;
+    reduceTransparency = _p.getBool('reduceTransparency') ?? false;
+    ambient = _p.getBool('ambient') ?? true;
+    themeKey = _p.getString('theme') ?? 'system';
+    themeMode.value = _modeFor(themeKey);
     favorites = (_p.getStringList('favorites') ?? <String>[]).toSet();
     knownIds = (_p.getStringList('knownIds') ?? <String>[]).toSet();
+    lastId = _p.getString('lastId');
+    lastPosMs = _p.getInt('lastPosMs') ?? 0;
     final raw = _p.getString('remote_items');
     if (raw != null) {
       try {
@@ -64,6 +84,17 @@ class AppState extends ChangeNotifier {
             .map((e) => VideoItem.fromJson(e as Map<String, dynamic>))
             .toList();
       } catch (_) {}
+    }
+  }
+
+  ThemeMode _modeFor(String k) {
+    switch (k) {
+      case 'light':
+        return ThemeMode.light;
+      case 'dark':
+        return ThemeMode.dark;
+      default:
+        return ThemeMode.system;
     }
   }
 
@@ -118,7 +149,7 @@ class AppState extends ChangeNotifier {
         return c != 0 ? c : idx[a.id]!.compareTo(idx[b.id]!);
       });
     }
-    // Resurface one memory near the top.
+    // Quietly resurface one memory (same day in a past year) near the top.
     if (sorted.length > 3) {
       final i = sorted.indexWhere((v) => v.memoryLabel != null);
       if (i > 2) {
@@ -179,6 +210,12 @@ class AppState extends ChangeNotifier {
     });
   }
 
+  void throttleAmbient() {
+    if (ambientThrottled) return;
+    ambientThrottled = true;
+    _showToast('Ambient blur paused to keep scrolling smooth');
+  }
+
   /// Applies pending settings changes once, when the user leaves Settings.
   Future<void> applyChanges() async {
     if (_remoteDirty) {
@@ -192,6 +229,16 @@ class AppState extends ChangeNotifier {
   }
 
   void markDirty() => _dirty = true;
+
+  // ---- Resume ----
+
+  Future<void> saveResume(String? id, int posMs) async {
+    if (id == null) return;
+    lastId = id;
+    lastPosMs = posMs;
+    await _p.setString('lastId', id);
+    await _p.setInt('lastPosMs', posMs);
+  }
 
   // ---- Favorites ----
 
@@ -269,5 +316,31 @@ class AppState extends ChangeNotifier {
     cacheOffline = v;
     notifyListeners();
     await _p.setBool('cacheOffline', v);
+  }
+
+  Future<void> setShowShare(bool v) async {
+    showShare = v;
+    notifyListeners();
+    await _p.setBool('showShare', v);
+  }
+
+  Future<void> setReduceTransparency(bool v) async {
+    reduceTransparency = v;
+    notifyListeners();
+    await _p.setBool('reduceTransparency', v);
+  }
+
+  Future<void> setAmbient(bool v) async {
+    ambient = v;
+    if (v) ambientThrottled = false;
+    notifyListeners();
+    await _p.setBool('ambient', v);
+  }
+
+  Future<void> setTheme(String key) async {
+    themeKey = key;
+    themeMode.value = _modeFor(key);
+    notifyListeners();
+    await _p.setString('theme', key);
   }
 }

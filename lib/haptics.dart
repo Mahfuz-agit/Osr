@@ -2,16 +2,16 @@ import 'package:flutter/services.dart';
 
 import 'app_state.dart';
 
-/// Every action has its own haptic signature, so the feed can be felt
-/// without looking at it.
+/// Haptics are rare and meaningful: one for a favorite, light ticks at
+/// detents (scrub deciles, zoom fit and fill), one when scrubbing begins.
 class Haptics {
   static bool get _on => AppState.instance.haptics;
 
-  static void tick() {
+  static void selection() {
     if (_on) HapticFeedback.selectionClick();
   }
 
-  static void soft() {
+  static void light() {
     if (_on) HapticFeedback.lightImpact();
   }
 
@@ -19,12 +19,7 @@ class Haptics {
     if (_on) HapticFeedback.mediumImpact();
   }
 
-  static Future<void> like() async {
-    if (!_on) return;
-    HapticFeedback.heavyImpact();
-    await Future<void>.delayed(const Duration(milliseconds: 70));
-    HapticFeedback.lightImpact();
-    await Future<void>.delayed(const Duration(milliseconds: 80));
-    HapticFeedback.mediumImpact();
+  static void like() {
+    if (_on) HapticFeedback.mediumImpact();
   }
 }

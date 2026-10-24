@@ -1,22 +1,54 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' show FontFeature, ImageFilter;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 
 import 'app_state.dart';
 import 'cache.dart';
+import 'fit_math.dart';
+import 'glass.dart';
 import 'haptics.dart';
 import 'models.dart';
 import 'physics.dart';
-import 'settings_screen.dart';
+import 'settings_sheet.dart';
+import 'theme.dart';
+import 'zoom.dart';
 
-const Color _ink = Color(0xFF2C2C2A);
-const Color _glass = Color(0xE0FFFFFF);
-const Color _glassLine = Color(0x1A000000);
-const Color _pink = Color(0xFFD4537E);
-const Color _placeholder = Color(0xFFF1EFE8);
+final Listenable _never = ValueNotifier<int>(0);
+
+/// Watches frame times. If the ambient blur makes scrolling janky, it is
+/// switched off automatically.
+class AmbientGuard {
+  static bool active = false;
+  static bool _started = false;
+  static int _slow = 0;
+  static int _total = 0;
+
+  static void start() {
+    if (_started) return;
+    _started = true;
+    SchedulerBinding.instance.addTimingsCallback(_onTimings);
+  }
+
+  static void _onTimings(List<FrameTiming> timings) {
+    if (!active) return;
+    for (final t in timings) {
+      _total++;
+      if (t.totalSpan.inMilliseconds > 24) _slow++;
+    }
+    if (_total >= 180) {
+      if (_slow / _total > 0.35) AppState.instance.throttleAmbient();
+      _slow = 0;
+      _total = 0;
+    }
+  }
+}
 
 class FeedScreen extends StatefulWidget {
   const FeedScreen({super.key});
@@ -31,9 +63,16 @@ class _BurstData {
   final Offset pos;
 }
 
-class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
+class _FeedScreenState extends State<FeedScreen>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   final AppState app = AppState.instance;
   final PageController _page = PageController(keepPage: false);
+  late final ZoomController _zoom = ZoomController(this);
+  late final AnimationController _sheet = AnimationController(
+    vsync: this,
+    duration: Dur.slow,
+    reverseDuration: Dur.base,
+  );
 
   final Map<int, VideoPlayerController> _ctrls = <int, VideoPlayerController>{};
   final Set<int> _initializing = <int>{};
@@ -43,38 +82,70 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   final List<_BurstData> _bursts = <_BurstData>[];
 
   VideoPlayerController? _listening;
+  Size _screen = Size.zero;
   int _index = 0;
   int _seenVersion = -1;
   String? _currentId;
+  int? _pendingSeekMs;
+  bool _firstReset = true;
+
   bool _playing = true;
   bool _scrubbing = false;
   bool _advancing = false;
   bool _hud = true;
-  bool _inSettings = false;
+  bool _sheetOpen = false;
+  bool _zoomedFlag = false;
+  bool _multi = false;
+  bool _zooming = false;
+  int _sheetGen = 0;
+
+  int _pointers = 0;
+  Offset _downPos = Offset.zero;
+  Duration _downT = Duration.zero;
+  bool _moved = false;
+  bool _tapPending = false;
+  DateTime _lastTapAt = DateTime.fromMillisecondsSinceEpoch(0);
+  Offset _lastTapPos = Offset.zero;
+
   Timer? _hudTimer;
   Timer? _flashTimer;
-  Offset _lastTap = Offset.zero;
-  int _lastScrubSecond = -1;
-  String _scrubLabel = '';
+  Timer? _holdTimer;
+  Timer? _tapTimer;
+  Timer? _resumeTimer;
+
+  int _lastDecile = -1;
+  String _elapsed = '0:00';
+  String _remaining = '-0:00';
   int _burstId = 0;
 
   VideoItem? get _item =>
       (_index >= 0 && _index < app.items.length) ? app.items[_index] : null;
+
+  // ------------------------------------------------------------ lifecycle
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     app.addListener(_onApp);
+    _zoom.addListener(_onZoom);
+    _zoom.onDetent = (_) => Haptics.selection();
+    AmbientGuard.start();
     _showHud();
+    _resumeTimer = Timer.periodic(const Duration(seconds: 5), (_) => _saveResume());
   }
 
   @override
   void dispose() {
+    _saveResume();
     WidgetsBinding.instance.removeObserver(this);
     app.removeListener(_onApp);
+    _zoom.removeListener(_onZoom);
     _hudTimer?.cancel();
     _flashTimer?.cancel();
+    _holdTimer?.cancel();
+    _tapTimer?.cancel();
+    _resumeTimer?.cancel();
     _listening?.removeListener(_tick);
     for (final c in _ctrls.values) {
       c.dispose();
@@ -82,7 +153,10 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     _ctrls.clear();
     _progress.dispose();
     _flash.dispose();
+    _zoom.dispose();
+    _sheet.dispose();
     _page.dispose();
+    AmbientGuard.active = false;
     super.dispose();
   }
 
@@ -91,13 +165,21 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _playCurrent();
     } else if (state == AppLifecycleState.paused) {
+      _saveResume();
       for (final c in _ctrls.values) {
         c.pause();
       }
     }
   }
 
-  // ---------------------------------------------------------------- state
+  void _saveResume() {
+    final item = _item;
+    final c = _ctrls[_index];
+    if (item == null || c == null || !c.value.isInitialized) return;
+    app.saveResume(item.id, c.value.position.inMilliseconds);
+  }
+
+  // --------------------------------------------------------------- state
 
   void _onApp() {
     if (!mounted) return;
@@ -108,8 +190,18 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     setState(() {});
   }
 
+  void _onZoom() {
+    final z = _zoom.zoomed;
+    if (z != _zoomedFlag && mounted) setState(() => _zoomedFlag = z);
+  }
+
   void _resetFeed() {
-    final prevId = _currentId;
+    var prevId = _currentId;
+    var fromResume = false;
+    if (prevId == null && _firstReset) {
+      prevId = app.lastId;
+      fromResume = true;
+    }
     for (final k in _ctrls.keys.toList()) {
       _drop(k);
     }
@@ -117,13 +209,18 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     _failed.clear();
     _advancing = false;
     _progress.value = 0;
+    _zoom.resetNow();
 
     final list = app.items;
     var start = 0;
     if (prevId != null) {
       final f = list.indexWhere((v) => v.id == prevId);
-      if (f > 0) start = f;
+      if (f >= 0) {
+        start = f;
+        if (fromResume && app.lastPosMs > 1000) _pendingSeekMs = app.lastPosMs;
+      }
     }
+    if (list.isNotEmpty) _firstReset = false;
     _index = start;
     _currentId = list.isEmpty ? null : list[start].id;
 
@@ -139,7 +236,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ------------------------------------------------------------- video
+  // --------------------------------------------------------------- video
 
   Future<VideoPlayerController> _create(VideoItem item) async {
     if (!item.remote) {
@@ -174,6 +271,12 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         await c.dispose();
         return;
       }
+      if (i == _index && _pendingSeekMs != null) {
+        final ms = _pendingSeekMs!;
+        _pendingSeekMs = null;
+        final total = c.value.duration.inMilliseconds;
+        if (ms < total - 1000) await c.seekTo(Duration(milliseconds: ms));
+      }
       _ctrls[i] = c;
       if (i == _index) _playCurrent();
       setState(() {});
@@ -193,10 +296,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     Future<void>.delayed(const Duration(milliseconds: 900), () {
       if (!mounted) return;
       if (_failed.contains(_index) && _index + 1 < app.items.length) {
-        _page.nextPage(
-          duration: const Duration(milliseconds: 420),
-          curve: Curves.easeOutCubic,
-        );
+        _page.nextPage(duration: Dur.slow, curve: kEase);
       }
     });
   }
@@ -214,12 +314,13 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
 
   void _onPage(int i) {
     if (i == _index) return;
+    _saveResume();
     _index = i;
     _currentId = i < app.items.length ? app.items[i].id : null;
     _advancing = false;
     _progress.value = 0;
     _playing = true;
-    Haptics.tick();
+    _zoom.resetNow();
 
     for (final k in _ctrls.keys.toList()) {
       if (k < i - 1 || k > i + 2) _drop(k);
@@ -233,9 +334,17 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     setState(() {});
   }
 
+  void _syncZoom() {
+    final c = _ctrls[_index];
+    if (c == null || !c.value.isInitialized || _screen.isEmpty) return;
+    final fit = FitMath.compute(_screen, c.value.size);
+    _zoom.configure(fit, _screen);
+    AmbientGuard.active = !fit.fill && app.ambientOn;
+  }
+
   void _playCurrent() {
     for (final e in _ctrls.entries) {
-      if (e.key == _index && _playing && !_scrubbing && !_inSettings) {
+      if (e.key == _index && _playing && !_scrubbing && !_sheetOpen) {
         e.value.setLooping(!app.autoNext);
         e.value.play();
       } else {
@@ -243,6 +352,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       }
     }
     _attach(_ctrls[_index]);
+    _syncZoom();
   }
 
   void _attach(VideoPlayerController? c) {
@@ -280,24 +390,127 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     if (MediaQuery.of(context).disableAnimations) {
       _page.jumpToPage(_index + 1);
     } else {
-      _page.nextPage(
-        duration: const Duration(milliseconds: 450),
-        curve: Curves.easeOutCubic,
-      );
+      _page.nextPage(duration: Dur.slow, curve: kEase);
     }
   }
 
   // ----------------------------------------------------------- gestures
 
+  void _onPointerDown(PointerDownEvent e) {
+    _pointers++;
+    if (_pointers == 1) {
+      _downPos = e.position;
+      _downT = e.timeStamp;
+      _moved = false;
+      _holdTimer?.cancel();
+      _holdTimer = Timer(const Duration(milliseconds: 450), () {
+        if (_pointers == 1 && !_moved && !_zoomedFlag && !_scrubbing && !_sheetOpen) {
+          _beginScrub(_downPos.dx);
+        }
+      });
+    } else {
+      _moved = true;
+      _holdTimer?.cancel();
+      if (!_multi) setState(() => _multi = true);
+    }
+    _showHud();
+  }
+
+  void _onPointerMove(PointerMoveEvent e) {
+    if (_pointers != 1) return;
+    if (!_moved && (e.position - _downPos).distance > 10) {
+      _moved = true;
+      _holdTimer?.cancel();
+    }
+    if (_scrubbing) _scrubTo(e.position.dx);
+  }
+
+  void _onPointerUp(PointerUpEvent e) {
+    final was = _pointers;
+    _pointers = math.max(0, _pointers - 1);
+    _holdTimer?.cancel();
+    if (_pointers == 0 && _multi) setState(() => _multi = false);
+    if (_scrubbing) {
+      if (_pointers == 0) _endScrub();
+      return;
+    }
+    if (was == 1 &&
+        !_moved &&
+        !_zooming &&
+        (e.timeStamp - _downT) < const Duration(milliseconds: 300)) {
+      _registerTap(e.position);
+    }
+  }
+
+  void _onPointerCancel(PointerCancelEvent e) {
+    _pointers = math.max(0, _pointers - 1);
+    _holdTimer?.cancel();
+    if (_pointers == 0 && _multi) setState(() => _multi = false);
+    if (_scrubbing && _pointers == 0) _endScrub();
+  }
+
+  void _registerTap(Offset pos) {
+    final now = DateTime.now();
+    if (_tapPending &&
+        now.difference(_lastTapAt).inMilliseconds < 300 &&
+        (pos - _lastTapPos).distance < 80) {
+      _tapTimer?.cancel();
+      _tapPending = false;
+      _onDoubleTap(pos);
+      return;
+    }
+    _tapPending = true;
+    _lastTapAt = now;
+    _lastTapPos = pos;
+    _tapTimer?.cancel();
+    _tapTimer = Timer(const Duration(milliseconds: 220), () {
+      _tapPending = false;
+      _togglePlay();
+    });
+  }
+
+  void _onDoubleTap(Offset pos) {
+    if (_zoom.zoomed) {
+      _zoom.reset();
+      Haptics.selection();
+    } else {
+      _like(pos);
+    }
+  }
+
+  void _onScaleStart(ScaleStartDetails d) {
+    if (d.pointerCount >= 2 || _zoom.zoomed) {
+      _syncZoom();
+      _zooming = true;
+      _zoom.start(d.localFocalPoint);
+      _holdTimer?.cancel();
+      if (_hud) setState(() => _hud = false);
+    } else {
+      _zooming = false;
+    }
+  }
+
+  void _onScaleUpdate(ScaleUpdateDetails d) {
+    if (!_zooming) return;
+    if (d.pointerCount < 2 && !_zoom.zoomed) return;
+    _zoom.update(d.scale, d.localFocalPoint);
+  }
+
+  void _onScaleEnd(ScaleEndDetails d) {
+    if (!_zooming) return;
+    _zooming = false;
+    _zoom.end(d.velocity.pixelsPerSecond);
+    _showHud();
+  }
+
+  // ------------------------------------------------------------ actions
+
   void _togglePlay() {
     setState(() => _playing = !_playing);
     _playCurrent();
-    Haptics.soft();
     _flash.value = true;
     _flashTimer?.cancel();
-    _flashTimer = Timer(const Duration(milliseconds: 520), () {
-      _flash.value = false;
-    });
+    _flashTimer = Timer(const Duration(milliseconds: 520), () => _flash.value = false);
     _showHud();
   }
 
@@ -313,47 +526,63 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   void _toggleHeart() {
     final item = _item;
     if (item == null) return;
-    app.setFav(item.id, !app.isFav(item.id));
-    Haptics.soft();
+    final now = !app.isFav(item.id);
+    app.setFav(item.id, now);
+    if (now) {
+      Haptics.like();
+    } else {
+      Haptics.light();
+    }
     _showHud();
   }
 
-  void _scrubStart(LongPressStartDetails d) {
+  Future<void> _share() async {
+    final item = _item;
+    if (item == null) return;
+    Haptics.light();
+    try {
+      if (!item.remote) {
+        await SharePlus.instance.share(ShareParams(files: <XFile>[XFile(item.uri)]));
+      } else {
+        await SharePlus.instance.share(ShareParams(text: item.uri));
+      }
+    } catch (_) {}
+  }
+
+  void _beginScrub(double dx) {
     final c = _ctrls[_index];
-    if (c == null) return;
+    if (c == null || !c.value.isInitialized) return;
     _scrubbing = true;
     c.pause();
     Haptics.medium();
-    _lastScrubSecond = -1;
+    _lastDecile = -1;
     _hudTimer?.cancel();
-    _scrubTo(d.globalPosition.dx);
-    setState(() => _hud = true);
-  }
-
-  void _scrubMove(LongPressMoveUpdateDetails d) {
-    if (_scrubbing) _scrubTo(d.globalPosition.dx);
+    _scrubTo(dx);
+    setState(() {});
   }
 
   void _scrubTo(double dx) {
     final c = _ctrls[_index];
     if (c == null) return;
-    final w = MediaQuery.of(context).size.width;
-    final f = (dx / w).clamp(0.0, 1.0).toDouble();
+    final w = _screen.width;
+    final f = ((dx - 24) / (w - 48)).clamp(0.0, 1.0).toDouble();
     final total = c.value.duration;
     final pos = Duration(milliseconds: (total.inMilliseconds * f).round());
     c.seekTo(pos);
     _progress.value = f;
-    if (pos.inSeconds != _lastScrubSecond) {
-      _lastScrubSecond = pos.inSeconds;
-      Haptics.tick();
-    }
-    setState(() => _scrubLabel = '${_fmt(pos)} / ${_fmt(total)}');
+    final decile = (f * 10).floor();
+    if (_lastDecile != -1 && decile != _lastDecile) Haptics.selection();
+    _lastDecile = decile;
+    setState(() {
+      _elapsed = _fmt(pos);
+      _remaining = '-${_fmt(total - pos)}';
+    });
   }
 
-  void _scrubEnd() {
+  void _endScrub() {
     if (!_scrubbing) return;
     _scrubbing = false;
-    if (_playing) _ctrls[_index]?.play();
+    if (_playing && !_sheetOpen) _ctrls[_index]?.play();
     _showHud();
     setState(() {});
   }
@@ -369,432 +598,793 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     });
   }
 
-  Future<void> _openSettings() async {
-    _inSettings = true;
+  // -------------------------------------------------------------- sheet
+
+  void _openSheet() {
+    _hudTimer?.cancel();
+    setState(() {
+      _sheetGen++;
+      _sheetOpen = true;
+    });
     _playCurrent();
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => const SettingsScreen()),
-    );
-    _inSettings = false;
+    _sheet.animateTo(1.0, duration: Dur.slow, curve: kEase);
+  }
+
+  Future<void> _closeSheet() async {
+    await _sheet.animateBack(0.0, duration: Dur.base, curve: kEase);
+    if (!mounted) return;
+    setState(() => _sheetOpen = false);
     await app.applyChanges();
     if (!mounted) return;
     _playCurrent();
     _showHud();
   }
 
+  void _sheetDrag(double dy, double sheetHeight) {
+    _sheet.value = (_sheet.value - dy / sheetHeight).clamp(0.0, 1.0).toDouble();
+  }
+
+  void _sheetDragEnd(double velocityY) {
+    if (velocityY > 800 || (velocityY.abs() <= 800 && _sheet.value < 0.6)) {
+      _closeSheet();
+    } else {
+      _sheet.animateTo(1.0, duration: Dur.base, curve: kEase);
+    }
+  }
+
   // -------------------------------------------------------------- build
 
   @override
   Widget build(BuildContext context) {
-    final items = app.items;
-    if (items.isEmpty) {
-      return _Empty(loading: app.loading, onSources: _openSettings);
-    }
     final mq = MediaQuery.of(context);
+    final pal = Pal.of(context);
+    _screen = mq.size;
     final reduce = mq.disableAnimations;
-    final item = _item;
-    final fade = Duration(milliseconds: reduce ? 120 : 380);
+    final sheetTop = mq.padding.top + Sp.x2;
+    final sheetHeight = mq.size.height - sheetTop;
 
-    return Scaffold(
-      backgroundColor: _placeholder,
-      body: Listener(
-        behavior: HitTestBehavior.translucent,
-        onPointerDown: (_) => _showHud(),
+    final Widget feedLayer =
+        app.items.isEmpty ? _buildEmpty(pal) : _buildFeed(mq, pal, reduce);
+
+    final overlay = (pal.dark ? SystemUiOverlayStyle.light : SystemUiOverlayStyle.dark)
+        .copyWith(
+      statusBarColor: Colors.transparent,
+      systemNavigationBarColor: Colors.transparent,
+    );
+
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: overlay,
+      child: PopScope(
+        canPop: !_sheetOpen,
+        onPopInvokedWithResult: (didPop, result) {
+          if (!didPop && _sheetOpen) _closeSheet();
+        },
+        child: Scaffold(
+          backgroundColor: pal.bg,
+          body: Stack(
+            fit: StackFit.expand,
+            children: [
+              // Feed, pushed back while the sheet is open (iOS-style depth).
+              AnimatedBuilder(
+                animation: _sheet,
+                child: feedLayer,
+                builder: (context, child) {
+                  final v = kEase.transform(_sheet.value);
+                  return Transform.scale(
+                    scale: reduce ? 1.0 : 1.0 - 0.06 * v,
+                    child: ClipRRect(
+                      clipBehavior: v == 0 ? Clip.none : Clip.antiAlias,
+                      borderRadius: BorderRadius.circular(reduce ? 0 : 22 * v),
+                      child: child,
+                    ),
+                  );
+                },
+              ),
+
+              // Dim
+              Positioned.fill(
+                child: AnimatedBuilder(
+                  animation: _sheet,
+                  builder: (context, _) {
+                    final v = kEase.transform(_sheet.value);
+                    return IgnorePointer(
+                      ignoring: v == 0,
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: _closeSheet,
+                        child: ColoredBox(
+                          color: Colors.black.withAlpha((90 * v).round()),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+
+              // Sheet
+              Positioned.fill(
+                top: sheetTop,
+                child: AnimatedBuilder(
+                  animation: _sheet,
+                  builder: (context, _) {
+                    final v = kEase.transform(_sheet.value);
+                    final sheet = SettingsSheet(
+                      key: ValueKey<int>(_sheetGen),
+                      onClose: _closeSheet,
+                      onDragUpdate: (dy) => _sheetDrag(dy, sheetHeight),
+                      onDragEnd: _sheetDragEnd,
+                    );
+                    return IgnorePointer(
+                      ignoring: v == 0,
+                      child: reduce
+                          ? Opacity(opacity: v, child: sheet)
+                          : Transform.translate(
+                              offset: Offset(0, (1 - v) * sheetHeight),
+                              child: sheet,
+                            ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmpty(Pal pal) {
+    return ColoredBox(
+      color: pal.dark ? Colors.black : Colors.white,
+      child: SafeArea(
         child: Stack(
-          fit: StackFit.expand,
           children: [
-            GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: _togglePlay,
-              onDoubleTapDown: (d) => _lastTap = d.globalPosition,
-              onDoubleTap: () => _like(_lastTap),
-              onLongPressStart: _scrubStart,
-              onLongPressMoveUpdate: _scrubMove,
-              onLongPressEnd: (_) => _scrubEnd(),
-              onLongPressCancel: _scrubEnd,
-              child: PageView.builder(
-                scrollDirection: Axis.vertical,
-                controller: _page,
-                physics: reduce
-                    ? const PageScrollPhysics()
-                    : const FeedPhysics(parent: BouncingScrollPhysics()),
-                itemCount: items.length,
-                onPageChanged: _onPage,
-                itemBuilder: (context, i) => _VideoPage(
-                  controller: _ctrls[i],
-                  failed: _failed.contains(i),
-                ),
-              ),
-            ),
-
-            // Progress hairline
-            Positioned.fill(
-              child: IgnorePointer(
-                child: Align(
-                  alignment: Alignment.bottomLeft,
-                  child: ValueListenableBuilder<double>(
-                    valueListenable: _progress,
-                    builder: (context, p, _) => FractionallySizedBox(
-                      widthFactor: p,
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 160),
-                        curve: Curves.easeOutCubic,
-                        height: _scrubbing ? 8 : 3,
-                        decoration: const BoxDecoration(
-                          color: _ink,
-                          borderRadius:
-                              BorderRadius.only(topRight: Radius.circular(3)),
-                        ),
+            Center(
+              child: app.loading
+                  ? CircularProgressIndicator(color: pal.ink, strokeWidth: 2)
+                  : Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: Sp.x8),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Your feed is empty',
+                            style: TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w600,
+                              color: pal.ink,
+                            ),
+                          ),
+                          const SizedBox(height: Sp.x2),
+                          Text(
+                            'Add a phone folder or a link to your videos.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: pal.muted, fontSize: 15),
+                          ),
+                          const SizedBox(height: Sp.x6),
+                          FilledButton(
+                            onPressed: _openSheet,
+                            style: FilledButton.styleFrom(
+                              minimumSize: const Size(180, 52),
+                            ),
+                            child: const Text('Open sources'),
+                          ),
+                        ],
                       ),
                     ),
-                  ),
-                ),
-              ),
             ),
-
-            // Play / pause flash
-            Positioned.fill(
-              child: IgnorePointer(
-                child: Center(
-                  child: ValueListenableBuilder<bool>(
-                    valueListenable: _flash,
-                    builder: (context, on, _) => AnimatedScale(
-                      scale: on ? 1 : 0.7,
-                      duration: Duration(milliseconds: reduce ? 1 : 220),
-                      curve: Curves.easeOutBack,
-                      child: AnimatedOpacity(
-                        opacity: on ? 1 : 0,
-                        duration: const Duration(milliseconds: 180),
-                        child: Container(
-                          width: 68,
-                          height: 68,
-                          decoration: BoxDecoration(
-                            color: _glass,
-                            shape: BoxShape.circle,
-                            border: Border.all(color: _glassLine, width: 0.5),
-                          ),
-                          child: Icon(
-                            _playing ? Icons.play_arrow_rounded : Icons.pause_rounded,
-                            size: 34,
-                            color: _ink,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
-            // Heart bursts
-            for (final b in _bursts)
-              Positioned(
-                key: ValueKey<int>(b.id),
-                left: b.pos.dx - 90,
-                top: b.pos.dy - 90,
-                width: 180,
-                height: 180,
-                child: IgnorePointer(
-                  child: HeartBurst(
-                    reduce: reduce,
-                    onDone: () {
-                      if (mounted) {
-                        setState(() => _bursts.removeWhere((x) => x.id == b.id));
-                      }
-                    },
-                  ),
-                ),
-              ),
-
-            // Auto-hiding controls
-            Positioned.fill(
-              child: IgnorePointer(
-                ignoring: !_hud,
-                child: AnimatedOpacity(
-                  opacity: _hud ? 1 : 0,
-                  duration: fade,
-                  curve: Curves.easeOutCubic,
-                  child: Stack(
-                    children: [
-                      Positioned(
-                        top: mq.padding.top + 8,
-                        right: 12,
-                        child: _GlassButton(
-                          icon: Icons.tune_rounded,
-                          onTap: _openSettings,
-                        ),
-                      ),
-                      if (item != null)
-                        Positioned(
-                          left: 16,
-                          right: 16,
-                          bottom: mq.padding.bottom + 20,
-                          child: _InfoPill(
-                            item: item,
-                            fav: app.isFav(item.id),
-                            onHeart: _toggleHeart,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-
-            // Scrub time
-            if (_scrubbing)
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: mq.padding.bottom + 104,
-                child: IgnorePointer(
-                  child: Center(child: _Pill(text: _scrubLabel)),
-                ),
-              ),
-
-            // New videos toast
-            if (app.toast != null)
-              Positioned(
-                top: mq.padding.top + 14,
-                left: 0,
-                right: 0,
-                child: IgnorePointer(
-                  child: Center(
-                    child: TweenAnimationBuilder<double>(
-                      key: ValueKey<String?>(app.toast),
-                      tween: Tween<double>(begin: 0, end: 1),
-                      duration: Duration(milliseconds: reduce ? 100 : 420),
-                      curve: Curves.easeOutBack,
-                      builder: (context, t, child) => Opacity(
-                        opacity: t.clamp(0.0, 1.0).toDouble(),
-                        child: Transform.scale(scale: 0.85 + 0.15 * t, child: child),
-                      ),
-                      child: _Pill(text: app.toast ?? '', icon: Icons.sync_rounded),
-                    ),
-                  ),
-                ),
-              ),
           ],
         ),
       ),
     );
   }
+
+  Widget _buildFeed(MediaQueryData mq, Pal pal, bool reduce) {
+    final chrome = _hud && !_scrubbing && !_zooming && !_sheetOpen;
+    final h = mq.size.height;
+    final item = _item;
+    final fav = item != null && app.isFav(item.id);
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        Listener(
+          behavior: HitTestBehavior.translucent,
+          onPointerDown: _onPointerDown,
+          onPointerMove: _onPointerMove,
+          onPointerUp: _onPointerUp,
+          onPointerCancel: _onPointerCancel,
+          child: GestureDetector(
+            onScaleStart: _onScaleStart,
+            onScaleUpdate: _onScaleUpdate,
+            onScaleEnd: _onScaleEnd,
+            child: PageView.builder(
+              scrollDirection: Axis.vertical,
+              controller: _page,
+              physics: (_zoomedFlag || _multi || _scrubbing)
+                  ? const NeverScrollableScrollPhysics()
+                  : reduce
+                      ? const PageScrollPhysics()
+                      : const FeedPhysics(parent: BouncingScrollPhysics()),
+              itemCount: app.items.length,
+              onPageChanged: _onPage,
+              itemBuilder: (context, i) {
+                final page = RepaintBoundary(
+                  child: _VideoPage(
+                    controller: _ctrls[i],
+                    failed: _failed.contains(i),
+                    screen: mq.size,
+                    zoom: i == _index ? _zoom : null,
+                    pal: pal,
+                    ambientOn: app.ambientOn,
+                  ),
+                );
+                return AnimatedBuilder(
+                  animation: _page,
+                  child: page,
+                  builder: (context, child) {
+                    final p = (_page.hasClients ? _page.page : null) ?? i.toDouble();
+                    final rel = i - p;
+                    final ar = rel.abs().clamp(0.0, 1.0).toDouble();
+                    if (reduce) {
+                      return Opacity(opacity: 1.0 - ar, child: child);
+                    }
+                    final outgoing = rel <= 0;
+                    return Transform.translate(
+                      offset: Offset(0, outgoing ? -rel * h * 0.7 : 0),
+                      child: Transform.scale(
+                        scale: outgoing ? 1.0 - 0.04 * ar : 1.0,
+                        child: Opacity(
+                          opacity: outgoing ? 1.0 - 0.4 * ar : 1.0,
+                          child: child,
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ),
+
+        // Progress hairline
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          height: 3,
+          child: IgnorePointer(
+            child: AnimatedOpacity(
+              opacity: _scrubbing ? 0 : 1,
+              duration: Dur.fast,
+              child: ValueListenableBuilder<double>(
+                valueListenable: _progress,
+                builder: (context, p, _) => Align(
+                  alignment: Alignment.centerLeft,
+                  child: FractionallySizedBox(
+                    widthFactor: p,
+                    child: Container(
+                      height: 3,
+                      decoration: BoxDecoration(
+                        color: pal.ink.withAlpha(200),
+                        borderRadius: const BorderRadius.only(
+                          topRight: Radius.circular(2),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+
+        // Play / pause indicator
+        Positioned.fill(
+          child: IgnorePointer(
+            child: Center(
+              child: ValueListenableBuilder<bool>(
+                valueListenable: _flash,
+                builder: (context, on, _) => AnimatedScale(
+                  scale: on ? 1 : 0.7,
+                  duration: reduce ? Dur.fast : Dur.base,
+                  curve: kEase,
+                  child: AnimatedOpacity(
+                    opacity: on ? 1 : 0,
+                    duration: Dur.fast,
+                    child: Glass(
+                      circle: true,
+                      width: 68,
+                      height: 68,
+                      alignment: Alignment.center,
+                      child: Icon(
+                        _playing ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                        size: 34,
+                        color: pal.ink,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+
+        // Favorite hearts from double-tap
+        for (final b in _bursts)
+          Positioned(
+            key: ValueKey<int>(b.id),
+            left: b.pos.dx - 60,
+            top: b.pos.dy - 60,
+            width: 120,
+            height: 120,
+            child: IgnorePointer(
+              child: HeartBurst(
+                reduce: reduce,
+                onDone: () {
+                  if (mounted) {
+                    setState(() => _bursts.removeWhere((x) => x.id == b.id));
+                  }
+                },
+              ),
+            ),
+          ),
+
+        // Sources (top right, rarely used: hard to reach on purpose)
+        Positioned(
+          top: mq.padding.top + Sp.x2,
+          right: Sp.x4,
+          child: _Reveal(
+            visible: chrome,
+            delayMs: 0,
+            reduce: reduce,
+            child: GlassButton(
+              icon: Icons.tune_rounded,
+              size: 48,
+              iconSize: 22,
+              onTap: _openSheet,
+            ),
+          ),
+        ),
+
+        // Like and Share (bottom center, easy thumb zone)
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: mq.padding.bottom + Sp.x6,
+          child: Center(
+            child: _Reveal(
+              visible: chrome,
+              delayMs: 60,
+              reduce: reduce,
+              child: Glass(
+                radius: 36,
+                padding: const EdgeInsets.all(Sp.x1),
+                child: AnimatedSize(
+                  duration: Dur.base,
+                  curve: kEase,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (app.showShare) ...[
+                        Pressable(
+                          onTap: _share,
+                          child: SizedBox(
+                            width: 52,
+                            height: 52,
+                            child: Icon(Icons.ios_share_rounded,
+                                size: 24, color: pal.ink),
+                          ),
+                        ),
+                        const SizedBox(width: Sp.x2),
+                      ],
+                      _HeartButton(fav: fav, pal: pal, onTap: _toggleHeart),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+
+        // Scrub timeline (replaces the group while scrubbing)
+        Positioned(
+          left: Sp.x4,
+          right: Sp.x4,
+          bottom: mq.padding.bottom + Sp.x6,
+          child: IgnorePointer(
+            child: AnimatedOpacity(
+              opacity: _scrubbing ? 1 : 0,
+              duration: Dur.base,
+              curve: kEase,
+              child: AnimatedScale(
+                scale: _scrubbing ? 1 : 0.92,
+                duration: reduce ? Dur.fast : Dur.base,
+                curve: kEase,
+                child: Glass(
+                  radius: 24,
+                  padding: const EdgeInsets.fromLTRB(Sp.x6 - 4, Sp.x3, Sp.x6 - 4, Sp.x3 + 2),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(_elapsed, style: _timeStyle(pal)),
+                          Text(_remaining, style: _timeStyle(pal)),
+                        ],
+                      ),
+                      const SizedBox(height: Sp.x2),
+                      ValueListenableBuilder<double>(
+                        valueListenable: _progress,
+                        builder: (context, p, _) => _Track(progress: p, pal: pal),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+
+        // New videos toast
+        if (app.toast != null)
+          Positioned(
+            top: mq.padding.top + Sp.x4,
+            left: 0,
+            right: 0,
+            child: IgnorePointer(
+              child: Center(
+                child: TweenAnimationBuilder<double>(
+                  key: ValueKey<String?>(app.toast),
+                  tween: Tween<double>(begin: 0, end: 1),
+                  duration: reduce ? Dur.fast : Dur.slow,
+                  curve: kEase,
+                  builder: (context, t, child) => Opacity(
+                    opacity: t.clamp(0.0, 1.0).toDouble(),
+                    child: Transform.translate(
+                      offset: Offset(0, reduce ? 0 : -12 * (1 - t)),
+                      child: child,
+                    ),
+                  ),
+                  child: Glass(
+                    radius: 20,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: Sp.x4, vertical: Sp.x2 + 2),
+                    child: Text(
+                      app.toast ?? '',
+                      style: TextStyle(color: pal.ink, fontSize: 13),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  TextStyle _timeStyle(Pal pal) => TextStyle(
+        color: pal.ink.withAlpha(190),
+        fontSize: 12,
+        fontFeatures: const <FontFeature>[FontFeature.tabularFigures()],
+      );
 }
 
-// ------------------------------------------------------------ widgets
+// ---------------------------------------------------------------- widgets
 
 class _VideoPage extends StatelessWidget {
-  const _VideoPage({required this.controller, required this.failed});
+  const _VideoPage({
+    required this.controller,
+    required this.failed,
+    required this.screen,
+    required this.zoom,
+    required this.pal,
+    required this.ambientOn,
+  });
 
   final VideoPlayerController? controller;
   final bool failed;
+  final Size screen;
+  final ZoomController? zoom;
+  final Pal pal;
+  final bool ambientOn;
 
   @override
   Widget build(BuildContext context) {
     final c = controller;
-    Widget content = const SizedBox.expand();
-    if (c != null && c.value.isInitialized) {
-      final s = c.value.size;
-      final portrait = s.height >= s.width;
-      content = FittedBox(
-        fit: portrait ? BoxFit.cover : BoxFit.contain,
-        clipBehavior: Clip.hardEdge,
-        child: SizedBox(
-          width: s.width,
-          height: s.height,
-          child: VideoPlayer(c),
-        ),
+    if (c == null || !c.value.isInitialized) {
+      return ColoredBox(
+        color: pal.bg,
+        child: failed
+            ? Center(
+                child: Text(
+                  "Can't play this video",
+                  style: TextStyle(color: pal.muted, fontSize: 15),
+                ),
+              )
+            : null,
       );
     }
-    return ColoredBox(
-      color: _placeholder,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          AnimatedOpacity(
-            opacity: c != null ? 1 : 0,
-            duration: const Duration(milliseconds: 250),
-            child: content,
-          ),
-          if (failed)
-            const Center(
-              child: Text(
-                "Can't play this video",
-                style: TextStyle(color: Color(0xFF5F5E5A), fontSize: 15),
+
+    final vs = c.value.size;
+    final fit = FitMath.compute(screen, vs);
+    final Listenable anim = zoom ?? _never;
+
+    final sharp = SizedBox(
+      width: fit.base.width,
+      height: fit.base.height,
+      child: VideoPlayer(c),
+    );
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: Dur.base,
+      curve: kEase,
+      builder: (context, t, child) => Opacity(opacity: t, child: child),
+      child: ListenableBuilder(
+        listenable: anim,
+        builder: (context, _) {
+          final z = zoom?.z ?? 1.0;
+          final tx = zoom?.tx ?? 0.0;
+          final ty = zoom?.ty ?? 0.0;
+          final cover = math.min(
+            fit.base.width * z / screen.width,
+            fit.base.height * z / screen.height,
+          );
+          final showAmbient = !fit.fill && ambientOn && cover < 0.999;
+
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              ColoredBox(color: pal.bg),
+              if (showAmbient)
+                ClipRect(
+                  child: ImageFiltered(
+                    imageFilter: ImageFilter.blur(
+                      sigmaX: 28,
+                      sigmaY: 28,
+                      tileMode: TileMode.mirror,
+                    ),
+                    child: OverflowBox(
+                      minWidth: 0,
+                      minHeight: 0,
+                      maxWidth: double.infinity,
+                      maxHeight: double.infinity,
+                      child: SizedBox(
+                        width: vs.width * fit.sFill * 1.15,
+                        height: vs.height * fit.sFill * 1.15,
+                        child: VideoPlayer(c),
+                      ),
+                    ),
+                  ),
+                ),
+              if (showAmbient) ColoredBox(color: pal.ambientTint),
+              ClipRect(
+                child: Transform(
+                  alignment: Alignment.center,
+                  transform: Matrix4.identity()
+                    ..translate(tx, ty)
+                    ..scale(z, z, 1.0),
+                  child: OverflowBox(
+                    minWidth: 0,
+                    minHeight: 0,
+                    maxWidth: double.infinity,
+                    maxHeight: double.infinity,
+                    child: sharp,
+                  ),
+                ),
               ),
-            ),
-        ],
+            ],
+          );
+        },
       ),
     );
   }
 }
 
-class _InfoPill extends StatelessWidget {
-  const _InfoPill({required this.item, required this.fav, required this.onHeart});
+/// Fades and rises in, one control after another. Fast on the way out.
+class _Reveal extends StatefulWidget {
+  const _Reveal({
+    required this.visible,
+    required this.delayMs,
+    required this.reduce,
+    required this.child,
+  });
 
-  final VideoItem item;
-  final bool fav;
-  final VoidCallback onHeart;
+  final bool visible;
+  final int delayMs;
+  final bool reduce;
+  final Widget child;
+
+  @override
+  State<_Reveal> createState() => _RevealState();
+}
+
+class _RevealState extends State<_Reveal> with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  late final CurvedAnimation _curved;
+
+  @override
+  void initState() {
+    super.initState();
+    final total = 250 + widget.delayMs;
+    _c = AnimationController(
+      vsync: this,
+      duration: Duration(milliseconds: total),
+      reverseDuration: Dur.slow,
+      value: widget.visible ? 1.0 : 0.0,
+    );
+    _curved = CurvedAnimation(
+      parent: _c,
+      curve: Interval(widget.delayMs / total, 1.0, curve: kEase),
+      reverseCurve: kEase,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant _Reveal old) {
+    super.didUpdateWidget(old);
+    if (widget.visible != old.visible) {
+      if (widget.visible) {
+        _c.forward();
+      } else {
+        _c.reverse();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _curved.dispose();
+    _c.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final memory = item.memoryLabel;
-    return Container(
-      padding: const EdgeInsets.fromLTRB(18, 8, 6, 8),
-      decoration: BoxDecoration(
-        color: _glass,
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: _glassLine, width: 0.5),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  item.title,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: _ink,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-                if (memory != null)
-                  Text(
-                    memory,
-                    style: const TextStyle(
-                      color: Color(0xFF993556),
-                      fontSize: 12,
-                    ),
-                  ),
-              ],
+    return IgnorePointer(
+      ignoring: !widget.visible,
+      child: AnimatedBuilder(
+        animation: _curved,
+        child: widget.child,
+        builder: (context, child) {
+          final v = _curved.value;
+          return Opacity(
+            opacity: v.clamp(0.0, 1.0).toDouble(),
+            child: Transform.translate(
+              offset: Offset(0, widget.reduce ? 0 : 8 * (1 - v)),
+              child: child,
             ),
-          ),
-          IconButton(
-            onPressed: onHeart,
-            iconSize: 26,
-            constraints: const BoxConstraints(minWidth: 52, minHeight: 52),
-            icon: Icon(
-              fav ? Icons.favorite : Icons.favorite_border,
-              color: fav ? _pink : _ink,
-            ),
-          ),
-        ],
+          );
+        },
       ),
     );
   }
 }
 
-class _GlassButton extends StatelessWidget {
-  const _GlassButton({required this.icon, required this.onTap});
+/// The heart: the most used control, so it is the biggest (60).
+class _HeartButton extends StatefulWidget {
+  const _HeartButton({required this.fav, required this.pal, required this.onTap});
 
-  final IconData icon;
+  final bool fav;
+  final Pal pal;
   final VoidCallback onTap;
 
   @override
+  State<_HeartButton> createState() => _HeartButtonState();
+}
+
+class _HeartButtonState extends State<_HeartButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 280));
+
+  @override
+  void didUpdateWidget(covariant _HeartButton old) {
+    super.didUpdateWidget(old);
+    if (widget.fav != old.fav && widget.fav) {
+      if (!MediaQuery.of(context).disableAnimations) _c.forward(from: 0);
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Material(
-      color: _glass,
-      shape: const CircleBorder(side: BorderSide(color: _glassLine, width: 0.5)),
-      child: InkWell(
-        customBorder: const CircleBorder(),
-        onTap: onTap,
-        child: SizedBox(
-          width: 52,
-          height: 52,
-          child: Icon(icon, color: _ink, size: 24),
+    final fav = widget.fav;
+    return Pressable(
+      onTap: widget.onTap,
+      child: AnimatedContainer(
+        duration: Dur.fast,
+        curve: kEase,
+        width: 60,
+        height: 60,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: fav ? Pal.pink.withAlpha(41) : Colors.transparent,
+        ),
+        child: Center(
+          child: AnimatedBuilder(
+            animation: _c,
+            builder: (context, child) {
+              final s = 1.0 + 0.25 * math.sin(_c.value * math.pi);
+              return Transform.scale(scale: s, child: child);
+            },
+            child: AnimatedSwitcher(
+              duration: Dur.fast,
+              child: Icon(
+                fav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+                key: ValueKey<bool>(fav),
+                size: 28,
+                color: fav ? Pal.pink : widget.pal.ink,
+              ),
+            ),
+          ),
         ),
       ),
     );
   }
 }
 
-class _Pill extends StatelessWidget {
-  const _Pill({required this.text, this.icon});
+class _Track extends StatelessWidget {
+  const _Track({required this.progress, required this.pal});
 
-  final String text;
-  final IconData? icon;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      decoration: BoxDecoration(
-        color: _glass,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: _glassLine, width: 0.5),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (icon != null) ...[
-            Icon(icon, size: 16, color: _ink),
-            const SizedBox(width: 6),
-          ],
-          Text(text, style: const TextStyle(color: _ink, fontSize: 13)),
-        ],
-      ),
-    );
-  }
-}
-
-class _Empty extends StatelessWidget {
-  const _Empty({required this.loading, required this.onSources});
-
-  final bool loading;
-  final VoidCallback onSources;
+  final double progress;
+  final Pal pal;
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.white,
-      body: SafeArea(
-        child: Center(
-          child: loading
-              ? const CircularProgressIndicator(color: _ink, strokeWidth: 2)
-              : Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 32),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text(
-                        'Your feed is empty',
-                        style: TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w500,
-                          color: _ink,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      const Text(
-                        'Add a phone folder or a manifest link.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Color(0xFF5F5E5A), fontSize: 15),
-                      ),
-                      const SizedBox(height: 24),
-                      FilledButton(
-                        onPressed: onSources,
-                        style: FilledButton.styleFrom(
-                          backgroundColor: _ink,
-                          minimumSize: const Size(180, 52),
-                        ),
-                        child: const Text('Open sources'),
-                      ),
-                    ],
+    return SizedBox(
+      height: 20,
+      child: LayoutBuilder(
+        builder: (context, box) {
+          final w = box.maxWidth;
+          final x = (w * progress).clamp(0.0, w).toDouble();
+          return Stack(
+            alignment: Alignment.centerLeft,
+            children: [
+              Container(
+                height: 8,
+                decoration: BoxDecoration(
+                  color: pal.ink.withAlpha(60),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+              Container(
+                width: x,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: pal.ink,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+              Positioned(
+                left: math.max(0.0, x - 9),
+                child: Container(
+                  width: 18,
+                  height: 18,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.white,
+                    border: Border.all(color: const Color(0x33000000), width: 0.5),
                   ),
                 ),
-        ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
 }
 
-/// Heart that springs in with a ring of particles. Falls back to a plain
-/// fade when the system asks for reduced motion.
+/// One heart that springs in and floats away. No particles.
+/// With reduced motion it simply fades.
 class HeartBurst extends StatefulWidget {
   const HeartBurst({super.key, required this.reduce, required this.onDone});
 
@@ -805,8 +1395,7 @@ class HeartBurst extends StatefulWidget {
   State<HeartBurst> createState() => _HeartBurstState();
 }
 
-class _HeartBurstState extends State<HeartBurst>
-    with SingleTickerProviderStateMixin {
+class _HeartBurstState extends State<HeartBurst> with SingleTickerProviderStateMixin {
   late final AnimationController _c;
 
   @override
@@ -814,7 +1403,7 @@ class _HeartBurstState extends State<HeartBurst>
     super.initState();
     _c = AnimationController(
       vsync: this,
-      duration: Duration(milliseconds: widget.reduce ? 450 : 800),
+      duration: widget.reduce ? Dur.base : const Duration(milliseconds: 700),
     );
     _c.forward().whenComplete(() {
       if (mounted) widget.onDone();
@@ -835,52 +1424,22 @@ class _HeartBurstState extends State<HeartBurst>
         final t = _c.value;
         final scale = widget.reduce
             ? 1.0
-            : 0.3 +
-                0.9 * Curves.elasticOut.transform((t / 0.55).clamp(0.0, 1.0).toDouble());
+            : 0.4 + 0.8 * Curves.elasticOut.transform((t / 0.5).clamp(0.0, 1.0).toDouble());
         final opacity =
             t < 0.6 ? 1.0 : (1 - (t - 0.6) / 0.4).clamp(0.0, 1.0).toDouble();
-        final lift = widget.reduce ? 0.0 : -34 * Curves.easeOut.transform(t);
-
-        final kids = <Widget>[];
-        if (!widget.reduce) {
-          for (var i = 0; i < 9; i++) {
-            final a = i / 9 * math.pi * 2;
-            final d = (52 + (i % 3) * 12) * Curves.easeOutCubic.transform(t);
-            final s = 7 * (1 - t * 0.8);
-            kids.add(
-              Positioned(
-                left: 90 + math.cos(a) * d - s / 2,
-                top: 90 + math.sin(a) * d - s / 2,
-                child: Opacity(
-                  opacity: (1 - t).clamp(0.0, 1.0).toDouble(),
-                  child: Container(
-                    width: s,
-                    height: s,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: i.isEven ? _pink : const Color(0xFFED93B1),
-                    ),
-                  ),
-                ),
-              ),
-            );
-          }
-        }
-        kids.add(
-          Center(
-            child: Transform.translate(
-              offset: Offset(0, lift),
-              child: Opacity(
-                opacity: opacity,
-                child: Transform.scale(
-                  scale: scale,
-                  child: const Icon(Icons.favorite, size: 76, color: _pink),
-                ),
+        final lift = widget.reduce ? 0.0 : -28 * Curves.easeOut.transform(t);
+        return Center(
+          child: Transform.translate(
+            offset: Offset(0, lift),
+            child: Opacity(
+              opacity: opacity,
+              child: Transform.scale(
+                scale: scale,
+                child: const Icon(Icons.favorite_rounded, size: 80, color: Pal.pink),
               ),
             ),
           ),
         );
-        return Stack(clipBehavior: Clip.none, children: kids);
       },
     );
   }
