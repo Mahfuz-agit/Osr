@@ -1,7 +1,7 @@
 name: personal_feed
 description: Your own feed. Your own videos. Nothing else.
 publish_to: 'none'
-version: 2.0.0+2
+version: 2.1.0+3
 
 environment:
   sdk: '>=3.8.0 <4.0.0'
@@ -17,5 +17,17 @@ dependencies:
   file_picker: '>=11.0.0 <14.0.0'
   share_plus: '>=11.0.0 <15.0.0'
 
+dev_dependencies:
+  flutter_launcher_icons: '>=0.14.0 <1.0.0'
+
 flutter:
   uses-material-design: true
+
+flutter_launcher_icons:
+  android: "ic_launcher"
+  ios: false
+  image_path: "assets/icon/icon.png"
+  adaptive_icon_background: "assets/icon/icon_bg.png"
+  adaptive_icon_foreground: "assets/icon/icon_fg.png"
+  adaptive_icon_monochrome: "assets/icon/icon_mono.png"
+  min_sdk_android: 21

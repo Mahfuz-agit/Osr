@@ -5,6 +5,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import 'app_state.dart';
 import 'cache.dart';
+import 'glyph.dart';
 import 'sources.dart';
 import 'theme.dart';
 
@@ -196,7 +197,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
                     _switchTile('Use phone folder', app.folderEnabled, app.setFolderEnabled,
                         subtitle: '${app.localCount} videos'),
                     CupertinoListTile(
-                      leading: Icon(Icons.folder_outlined, color: accent, size: 22),
+                      leading: Glyph(GlyphKind.folder, size: 22, color: accent),
                       title: const Text('Choose folder'),
                       additionalInfo: Text(folderLabel),
                       trailing: const CupertinoListTileChevron(),
@@ -211,7 +212,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
                     ),
                     if (!_access)
                       CupertinoListTile(
-                        leading: Icon(Icons.lock_open_rounded, color: accent, size: 22),
+                        leading: Glyph(GlyphKind.lockOpen, size: 22, color: accent),
                         title: const Text('Allow video access'),
                         subtitle: const Text('Needed to read your phone folder'),
                         trailing: const CupertinoListTileChevron(),
@@ -230,11 +231,16 @@ class _SettingsSheetState extends State<SettingsSheet> {
                         trailing: GestureDetector(
                           behavior: HitTestBehavior.opaque,
                           onTap: () => app.removeManifest(u),
-                          child: const SizedBox(
+                          child: SizedBox(
                             width: 44,
                             height: 44,
-                            child: Icon(Icons.remove_circle,
-                                color: CupertinoColors.systemRed, size: 22),
+                            child: Center(
+                              child: Glyph(
+                                GlyphKind.minusCircle,
+                                size: 22,
+                                color: CupertinoColors.systemRed.resolveFrom(context),
+                              ),
+                            ),
                           ),
                         ),
                       ),
@@ -254,7 +260,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
                       subtitle: Text('${app.remoteCount} videos from links'),
                       trailing: app.refreshing
                           ? const CupertinoActivityIndicator()
-                          : Icon(Icons.refresh_rounded, color: accent, size: 22),
+                          : Glyph(GlyphKind.refresh, size: 22, color: accent),
                       onTap: app.refreshing ? null : () => app.refreshRemote(),
                     ),
                   ],
@@ -273,6 +279,19 @@ class _SettingsSheetState extends State<SettingsSheet> {
                         subtitle: 'Off means each video loops'),
                     _switchTile('Share button', app.showShare, app.setShowShare),
                     _switchTile('Haptics', app.haptics, app.setHaptics),
+                  ],
+                ),
+                CupertinoListSection.insetGrouped(
+                  backgroundColor: bg,
+                  header: const Text('Video fit'),
+                  footer: const Text(
+                      'Smart fills the screen only when at most 10% would be cropped. Otherwise the whole video is shown.'),
+                  children: [
+                    _segmented(
+                      app.fitPolicy,
+                      const {'smart': 'Smart', 'fill': 'Fill', 'fit': 'Fit'},
+                      app.setFitPolicy,
+                    ),
                   ],
                 ),
                 CupertinoListSection.insetGrouped(

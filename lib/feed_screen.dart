@@ -13,7 +13,9 @@ import 'app_state.dart';
 import 'cache.dart';
 import 'fit_math.dart';
 import 'glass.dart';
+import 'glyph.dart';
 import 'haptics.dart';
+import 'layout_math.dart';
 import 'models.dart';
 import 'physics.dart';
 import 'settings_sheet.dart';
@@ -187,6 +189,7 @@ class _FeedScreenState extends State<FeedScreen>
       _seenVersion = app.feedVersion;
       _resetFeed();
     }
+    _syncZoom();
     setState(() {});
   }
 
@@ -337,7 +340,7 @@ class _FeedScreenState extends State<FeedScreen>
   void _syncZoom() {
     final c = _ctrls[_index];
     if (c == null || !c.value.isInitialized || _screen.isEmpty) return;
-    final fit = FitMath.compute(_screen, c.value.size);
+    final fit = FitMath.compute(_screen, c.value.size, policy: app.fitPolicy);
     _zoom.configure(fit, _screen);
     AmbientGuard.active = !fit.fill && app.ambientOn;
   }
@@ -646,8 +649,7 @@ class _FeedScreenState extends State<FeedScreen>
     final Widget feedLayer =
         app.items.isEmpty ? _buildEmpty(pal) : _buildFeed(mq, pal, reduce);
 
-    final overlay = (pal.dark ? SystemUiOverlayStyle.light : SystemUiOverlayStyle.dark)
-        .copyWith(
+    final overlay = SystemUiOverlayStyle.light.copyWith(
       statusBarColor: Colors.transparent,
       systemNavigationBarColor: Colors.transparent,
     );
@@ -660,7 +662,7 @@ class _FeedScreenState extends State<FeedScreen>
           if (!didPop && _sheetOpen) _closeSheet();
         },
         child: Scaffold(
-          backgroundColor: pal.bg,
+          backgroundColor: Colors.black,
           body: Stack(
             fit: StackFit.expand,
             children: [
@@ -780,6 +782,10 @@ class _FeedScreenState extends State<FeedScreen>
   }
 
   Widget _buildFeed(MediaQueryData mq, Pal pal, bool reduce) {
+    // The feed is always a dark canvas, like the iOS video player: dark glass,
+    // white glyphs, whatever the app appearance is.
+    final fp = Pal.darkPal;
+    final zones = UiZones.of(mq);
     final chrome = _hud && !_scrubbing && !_zooming && !_sheetOpen;
     final h = mq.size.height;
     final item = _item;
@@ -815,8 +821,8 @@ class _FeedScreenState extends State<FeedScreen>
                     failed: _failed.contains(i),
                     screen: mq.size,
                     zoom: i == _index ? _zoom : null,
-                    pal: pal,
                     ambientOn: app.ambientOn,
+                    policy: app.fitPolicy,
                   ),
                 );
                 return AnimatedBuilder(
@@ -866,7 +872,7 @@ class _FeedScreenState extends State<FeedScreen>
                     child: Container(
                       height: 3,
                       decoration: BoxDecoration(
-                        color: pal.ink.withAlpha(200),
+                        color: Colors.white.withAlpha(210),
                         borderRadius: const BorderRadius.only(
                           topRight: Radius.circular(2),
                         ),
@@ -894,13 +900,14 @@ class _FeedScreenState extends State<FeedScreen>
                     duration: Dur.fast,
                     child: Glass(
                       circle: true,
+                      forceDark: true,
                       width: 68,
                       height: 68,
                       alignment: Alignment.center,
-                      child: Icon(
-                        _playing ? Icons.play_arrow_rounded : Icons.pause_rounded,
-                        size: 34,
-                        color: pal.ink,
+                      child: Glyph(
+                        _playing ? GlyphKind.play : GlyphKind.pause,
+                        size: 30,
+                        color: Colors.white,
                       ),
                     ),
                   ),
@@ -910,7 +917,7 @@ class _FeedScreenState extends State<FeedScreen>
           ),
         ),
 
-        // Favorite hearts from double-tap
+        // Hearts from double-tap
         for (final b in _bursts)
           Positioned(
             key: ValueKey<int>(b.id),
@@ -930,68 +937,65 @@ class _FeedScreenState extends State<FeedScreen>
             ),
           ),
 
-        // Sources (top right, rarely used: hard to reach on purpose)
+        // Sources: rarely used, so it lives in the hard-to-reach top corner,
+        // inside the top 14% band.
         Positioned(
-          top: mq.padding.top + Sp.x2,
+          top: zones.topOffset,
           right: Sp.x4,
           child: _Reveal(
             visible: chrome,
             delayMs: 0,
             reduce: reduce,
             child: GlassButton(
-              icon: Icons.tune_rounded,
-              size: 48,
-              iconSize: 22,
+              glyph: GlyphKind.sliders,
+              size: zones.topButton,
               onTap: _openSheet,
             ),
           ),
         ),
 
-        // Like and Share (bottom center, easy thumb zone)
+        // Share and Like: bottom center, inside the bottom 35% band, the
+        // lower edge always above the system inset by 16.
         Positioned(
           left: 0,
           right: 0,
-          bottom: mq.padding.bottom + Sp.x6,
+          bottom: zones.bottomOffset,
           child: Center(
             child: _Reveal(
               visible: chrome,
               delayMs: 60,
               reduce: reduce,
-              child: Glass(
-                radius: 36,
-                padding: const EdgeInsets.all(Sp.x1),
-                child: AnimatedSize(
-                  duration: Dur.base,
-                  curve: kEase,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (app.showShare) ...[
-                        Pressable(
-                          onTap: _share,
-                          child: SizedBox(
-                            width: 52,
-                            height: 52,
-                            child: Icon(Icons.ios_share_rounded,
-                                size: 24, color: pal.ink),
-                          ),
-                        ),
-                        const SizedBox(width: Sp.x2),
-                      ],
-                      _HeartButton(fav: fav, pal: pal, onTap: _toggleHeart),
+              child: AnimatedSize(
+                duration: Dur.base,
+                curve: kEase,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (app.showShare) ...[
+                      GlassButton(
+                        glyph: GlyphKind.share,
+                        size: zones.bottomButton,
+                        onTap: _share,
+                      ),
+                      const SizedBox(width: Sp.x6),
                     ],
-                  ),
+                    _LikeButton(
+                      fav: fav,
+                      size: zones.bottomButton,
+                      onTap: _toggleHeart,
+                    ),
+                  ],
                 ),
               ),
             ),
           ),
         ),
 
-        // Scrub timeline (replaces the group while scrubbing)
+        // Scrub timeline (replaces the buttons while scrubbing)
         Positioned(
           left: Sp.x4,
           right: Sp.x4,
-          bottom: mq.padding.bottom + Sp.x6,
+          bottom: zones.bottomOffset,
           child: IgnorePointer(
             child: AnimatedOpacity(
               opacity: _scrubbing ? 1 : 0,
@@ -1003,21 +1007,23 @@ class _FeedScreenState extends State<FeedScreen>
                 curve: kEase,
                 child: Glass(
                   radius: 24,
-                  padding: const EdgeInsets.fromLTRB(Sp.x6 - 4, Sp.x3, Sp.x6 - 4, Sp.x3 + 2),
+                  forceDark: true,
+                  padding: const EdgeInsets.fromLTRB(
+                      Sp.x6 - 4, Sp.x3, Sp.x6 - 4, Sp.x3 + 2),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Text(_elapsed, style: _timeStyle(pal)),
-                          Text(_remaining, style: _timeStyle(pal)),
+                          Text(_elapsed, style: _timeStyle(fp)),
+                          Text(_remaining, style: _timeStyle(fp)),
                         ],
                       ),
                       const SizedBox(height: Sp.x2),
                       ValueListenableBuilder<double>(
                         valueListenable: _progress,
-                        builder: (context, p, _) => _Track(progress: p, pal: pal),
+                        builder: (context, p, _) => _Track(progress: p, pal: fp),
                       ),
                     ],
                   ),
@@ -1030,7 +1036,7 @@ class _FeedScreenState extends State<FeedScreen>
         // New videos toast
         if (app.toast != null)
           Positioned(
-            top: mq.padding.top + Sp.x4,
+            top: zones.topOffset + Sp.x2,
             left: 0,
             right: 0,
             child: IgnorePointer(
@@ -1049,11 +1055,12 @@ class _FeedScreenState extends State<FeedScreen>
                   ),
                   child: Glass(
                     radius: 20,
+                    forceDark: true,
                     padding: const EdgeInsets.symmetric(
                         horizontal: Sp.x4, vertical: Sp.x2 + 2),
                     child: Text(
                       app.toast ?? '',
-                      style: TextStyle(color: pal.ink, fontSize: 13),
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
                     ),
                   ),
                 ),
@@ -1079,28 +1086,68 @@ class _VideoPage extends StatelessWidget {
     required this.failed,
     required this.screen,
     required this.zoom,
-    required this.pal,
     required this.ambientOn,
+    required this.policy,
   });
 
   final VideoPlayerController? controller;
   final bool failed;
   final Size screen;
   final ZoomController? zoom;
-  final Pal pal;
   final bool ambientOn;
+  final String policy;
+
+  static const List<Color> _fadeColors = <Color>[
+    Color(0xFF000000),
+    Color(0xD1000000),
+    Color(0x73000000),
+    Color(0x00000000),
+  ];
+  static const List<double> _fadeStops = <double>[0.0, 0.22, 0.58, 1.0];
+
+  Widget _fade({
+    double? left,
+    double? right,
+    double? top,
+    double? bottom,
+    double? width,
+    double? height,
+    required Alignment from,
+    required Alignment to,
+  }) {
+    return Positioned(
+      left: left,
+      right: right,
+      top: top,
+      bottom: bottom,
+      width: width,
+      height: height,
+      child: IgnorePointer(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: from,
+              end: to,
+              colors: _fadeColors,
+              stops: _fadeStops,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final c = controller;
     if (c == null || !c.value.isInitialized) {
       return ColoredBox(
-        color: pal.bg,
+        color: Colors.black,
         child: failed
-            ? Center(
+            ? const Center(
                 child: Text(
                   "Can't play this video",
-                  style: TextStyle(color: pal.muted, fontSize: 15),
+                  style: TextStyle(color: Color(0x99FFFFFF), fontSize: 15),
                 ),
               )
             : null,
@@ -1108,7 +1155,7 @@ class _VideoPage extends StatelessWidget {
     }
 
     final vs = c.value.size;
-    final fit = FitMath.compute(screen, vs);
+    final fit = FitMath.compute(screen, vs, policy: policy);
     final Listenable anim = zoom ?? _never;
 
     final sharp = SizedBox(
@@ -1128,16 +1175,24 @@ class _VideoPage extends StatelessWidget {
           final z = zoom?.z ?? 1.0;
           final tx = zoom?.tx ?? 0.0;
           final ty = zoom?.ty ?? 0.0;
-          final cover = math.min(
-            fit.base.width * z / screen.width,
-            fit.base.height * z / screen.height,
-          );
-          final showAmbient = !fit.fill && ambientOn && cover < 0.999;
+          final dy = fit.dyAt(z);
+
+          // Where the video actually sits right now, and how wide the bars are.
+          final vw = fit.base.width * z;
+          final vh = fit.base.height * z;
+          final cx = screen.width / 2 + tx;
+          final cy = screen.height / 2 + ty + dy;
+          final top = math.max(0.0, cy - vh / 2);
+          final bottom = math.max(0.0, screen.height - (cy + vh / 2));
+          final left = math.max(0.0, cx - vw / 2);
+          final right = math.max(0.0, screen.width - (cx + vw / 2));
+          final hasBars = top > 0.5 || bottom > 0.5 || left > 0.5 || right > 0.5;
+          final showAmbient = ambientOn && hasBars;
 
           return Stack(
             fit: StackFit.expand,
             children: [
-              ColoredBox(color: pal.bg),
+              const ColoredBox(color: Colors.black),
               if (showAmbient)
                 ClipRect(
                   child: ImageFiltered(
@@ -1159,12 +1214,49 @@ class _VideoPage extends StatelessWidget {
                     ),
                   ),
                 ),
-              if (showAmbient) ColoredBox(color: pal.ambientTint),
+              // The blur is strongest next to the video and fades to black at
+              // the screen edges.
+              if (showAmbient && top > 0.5)
+                _fade(
+                  left: 0,
+                  right: 0,
+                  top: 0,
+                  height: top,
+                  from: Alignment.topCenter,
+                  to: Alignment.bottomCenter,
+                ),
+              if (showAmbient && bottom > 0.5)
+                _fade(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  height: bottom,
+                  from: Alignment.bottomCenter,
+                  to: Alignment.topCenter,
+                ),
+              if (showAmbient && left > 0.5)
+                _fade(
+                  left: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: left,
+                  from: Alignment.centerLeft,
+                  to: Alignment.centerRight,
+                ),
+              if (showAmbient && right > 0.5)
+                _fade(
+                  right: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: right,
+                  from: Alignment.centerRight,
+                  to: Alignment.centerLeft,
+                ),
               ClipRect(
                 child: Transform(
                   alignment: Alignment.center,
                   transform: Matrix4.identity()
-                    ..translate(tx, ty)
+                    ..translate(tx, ty + dy)
                     ..scale(z, z, 1.0),
                   child: OverflowBox(
                     minWidth: 0,
@@ -1263,28 +1355,28 @@ class _RevealState extends State<_Reveal> with SingleTickerProviderStateMixin {
   }
 }
 
-/// The heart: the most used control, so it is the biggest (60).
-class _HeartButton extends StatefulWidget {
-  const _HeartButton({required this.fav, required this.pal, required this.onTap});
+/// Like: heart glyph on dark glass. Fills pink with one small bounce.
+class _LikeButton extends StatefulWidget {
+  const _LikeButton({required this.fav, required this.size, required this.onTap});
 
   final bool fav;
-  final Pal pal;
+  final double size;
   final VoidCallback onTap;
 
   @override
-  State<_HeartButton> createState() => _HeartButtonState();
+  State<_LikeButton> createState() => _LikeButtonState();
 }
 
-class _HeartButtonState extends State<_HeartButton>
+class _LikeButtonState extends State<_LikeButton>
     with SingleTickerProviderStateMixin {
   late final AnimationController _c =
       AnimationController(vsync: this, duration: const Duration(milliseconds: 280));
 
   @override
-  void didUpdateWidget(covariant _HeartButton old) {
+  void didUpdateWidget(covariant _LikeButton old) {
     super.didUpdateWidget(old);
-    if (widget.fav != old.fav && widget.fav) {
-      if (!MediaQuery.of(context).disableAnimations) _c.forward(from: 0);
+    if (widget.fav && !old.fav && !MediaQuery.of(context).disableAnimations) {
+      _c.forward(from: 0);
     }
   }
 
@@ -1299,31 +1391,22 @@ class _HeartButtonState extends State<_HeartButton>
     final fav = widget.fav;
     return Pressable(
       onTap: widget.onTap,
-      child: AnimatedContainer(
-        duration: Dur.fast,
-        curve: kEase,
-        width: 60,
-        height: 60,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: fav ? Pal.pink.withAlpha(41) : Colors.transparent,
-        ),
-        child: Center(
-          child: AnimatedBuilder(
-            animation: _c,
-            builder: (context, child) {
-              final s = 1.0 + 0.25 * math.sin(_c.value * math.pi);
-              return Transform.scale(scale: s, child: child);
-            },
-            child: AnimatedSwitcher(
-              duration: Dur.fast,
-              child: Icon(
-                fav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-                key: ValueKey<bool>(fav),
-                size: 28,
-                color: fav ? Pal.pink : widget.pal.ink,
-              ),
-            ),
+      child: Glass(
+        circle: true,
+        forceDark: true,
+        width: widget.size,
+        height: widget.size,
+        alignment: Alignment.center,
+        child: AnimatedBuilder(
+          animation: _c,
+          builder: (context, child) => Transform.scale(
+            scale: 1.0 + 0.25 * math.sin(_c.value * math.pi),
+            child: child,
+          ),
+          child: Glyph(
+            fav ? GlyphKind.heartFill : GlyphKind.heart,
+            size: widget.size * 0.48,
+            color: fav ? Pal.pink : Colors.white,
           ),
         ),
       ),
@@ -1435,7 +1518,7 @@ class _HeartBurstState extends State<HeartBurst> with SingleTickerProviderStateM
               opacity: opacity,
               child: Transform.scale(
                 scale: scale,
-                child: const Icon(Icons.favorite_rounded, size: 80, color: Pal.pink),
+                child: const Glyph(GlyphKind.heartFill, size: 80, color: Pal.pink),
               ),
             ),
           ),

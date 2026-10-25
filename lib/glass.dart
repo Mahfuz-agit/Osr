@@ -3,6 +3,7 @@ import 'dart:ui' show ImageFilter;
 import 'package:flutter/material.dart';
 
 import 'app_state.dart';
+import 'glyph.dart';
 import 'theme.dart';
 
 /// Frosted glass: real backdrop blur, a translucent tint and a hairline edge.
@@ -17,9 +18,11 @@ class Glass extends StatelessWidget {
     this.circle = false,
     this.padding,
     this.alignment,
+    this.forceDark = false,
   });
 
   final Widget child;
+  final bool forceDark;
   final double? width;
   final double? height;
   final double radius;
@@ -29,7 +32,7 @@ class Glass extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final p = Pal.of(context);
+    final p = forceDark ? Pal.darkPal : Pal.of(context);
     final solid =
         AppState.instance.reduceTransparency || MediaQuery.of(context).highContrast;
     final box = Container(
@@ -88,32 +91,31 @@ class _PressableState extends State<Pressable> {
   }
 }
 
-/// Round glass button.
+/// Round glass button with a glyph. Used over video, so it is always the
+/// dark glass with a white glyph, like the iOS video player controls.
 class GlassButton extends StatelessWidget {
   const GlassButton({
     super.key,
-    required this.icon,
+    required this.glyph,
     required this.onTap,
     this.size = 48,
-    this.iconSize = 22,
   });
 
-  final IconData icon;
+  final GlyphKind glyph;
   final VoidCallback onTap;
   final double size;
-  final double iconSize;
 
   @override
   Widget build(BuildContext context) {
-    final p = Pal.of(context);
     return Pressable(
       onTap: onTap,
       child: Glass(
         circle: true,
+        forceDark: true,
         width: size,
         height: size,
         alignment: Alignment.center,
-        child: Icon(icon, size: iconSize, color: p.ink),
+        child: Glyph(glyph, size: size * 0.46, color: const Color(0xFFFFFFFF)),
       ),
     );
   }

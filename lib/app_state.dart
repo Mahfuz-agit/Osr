@@ -30,6 +30,7 @@ class AppState extends ChangeNotifier {
   bool reduceTransparency = false;
   bool ambient = true;
   String themeKey = 'system';
+  String fitPolicy = 'smart';
   final ValueNotifier<ThemeMode> themeMode = ValueNotifier<ThemeMode>(ThemeMode.system);
 
   Set<String> favorites = <String>{};
@@ -72,6 +73,7 @@ class AppState extends ChangeNotifier {
     reduceTransparency = _p.getBool('reduceTransparency') ?? false;
     ambient = _p.getBool('ambient') ?? true;
     themeKey = _p.getString('theme') ?? 'system';
+    fitPolicy = _p.getString('fitPolicy') ?? 'smart';
     themeMode.value = _modeFor(themeKey);
     favorites = (_p.getStringList('favorites') ?? <String>[]).toSet();
     knownIds = (_p.getStringList('knownIds') ?? <String>[]).toSet();
@@ -335,6 +337,12 @@ class AppState extends ChangeNotifier {
     if (v) ambientThrottled = false;
     notifyListeners();
     await _p.setBool('ambient', v);
+  }
+
+  Future<void> setFitPolicy(String v) async {
+    fitPolicy = v;
+    notifyListeners();
+    await _p.setString('fitPolicy', v);
   }
 
   Future<void> setTheme(String key) async {
