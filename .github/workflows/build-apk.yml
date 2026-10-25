@@ -57,6 +57,10 @@ jobs:
       - name: Get packages
         run: flutter pub get
 
+      - name: Generate app icon
+        run: |
+          dart run flutter_launcher_icons || echo "WARNING - icon generation failed, default icon will be used"
+
       - name: Install Android SDK platform 37
         run: |
           SDKM="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
