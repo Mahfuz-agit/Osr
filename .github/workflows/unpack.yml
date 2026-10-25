@@ -50,12 +50,12 @@ jobs:
           test -f "$SRC/pubspec.yaml" || { echo "pubspec.yaml missing in zip"; exit 1; }
           test -f "$SRC/lib/main.dart" || { echo "lib/main.dart missing in zip"; exit 1; }
 
-          rm -rf lib tool
+          rm -rf lib tool assets
           cp -a "$SRC"/. .
           rm -f project.zip
 
           echo "Arranged files:"
-          find lib tool -type f | sort
+          find lib tool assets -type f | sort
           ls -la
 
       - name: Commit and push
